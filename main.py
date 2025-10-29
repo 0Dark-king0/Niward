@@ -159,6 +159,17 @@ async def update_servers():
             print(f"❌ خطأ أثناء تحديث السيرفر {info.get('ip')}: {e}")
 
 # -------------------------------------------------------------------
+@bot.event
+async def on_ready():
+    print(f"✅ Logged in as {bot.user}")
+    try:
+        synced = await bot.tree.sync()
+        print(f"🔁 Synced {len(synced)} command(s)")
+    except Exception as e:
+        print(f"❌ Error syncing commands: {e}")
+
+
+
 # تشغيل البوت
 bot.run(TOKEN)
 
