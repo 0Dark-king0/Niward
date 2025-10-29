@@ -16,7 +16,7 @@ TOKEN = os.getenv("TOKEN")
 
 # إعدادات البوت
 intents = discord.Intents.default()
-intents.message_content = True  # ✅ إضافة intent مهم
+# ✅ ما نحتاج message_content لأن البوت يستخدم slash commands فقط
 bot = commands.Bot(command_prefix="!", intents=intents)
 bot.remove_command("help")
 
