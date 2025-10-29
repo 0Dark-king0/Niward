@@ -7,13 +7,16 @@ import json
 import asyncio
 import os
 from dotenv import load_dotenv
+from threading import Thread
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # تحميل متغيرات البيئة من .env
 load_dotenv()
-TOKEN = os.getenv("TOKEN")  # ✅ استخدم TOKEN زي ما قلت
+TOKEN = os.getenv("TOKEN")
 
 # إعدادات البوت
 intents = discord.Intents.default()
+intents.message_content = True  # ✅ إضافة intent مهم
 bot = commands.Bot(command_prefix="!", intents=intents)
 bot.remove_command("help")
 
@@ -22,31 +25,55 @@ DATA_FILE = "servers.json"
 
 def load_data():
     if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+        try:
+            with open(DATA_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except:
+            return {}
     return {}
 
 def save_data(data):
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=4, ensure_ascii=False)
+    try:
+        with open(DATA_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=4, ensure_ascii=False)
+    except Exception as e:
+        print(f"❌ خطأ في حفظ البيانات: {e}")
 
 servers_data = load_data()
-offline_counters = {}  # لتتبع حالات السيرفرات المؤقتة
+offline_counters = {}
+
+# ✅ HTTP Server بسيط لـ Railway Health Check
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(b'Bot is running!')
+    
+    def log_message(self, format, *args):
+        pass  # تعطيل الـ logs المزعجة
+
+def run_health_server():
+    port = int(os.getenv("PORT", 8080))
+    server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
+    print(f"✅ Health check server running on port {port}")
+    server.serve_forever()
 
 # -------------------------------------------------------------------
-# دالة التحقق الذكية من حالة السيرفر (تتعامل مع Aternos والـ standby)
+# دالة التحقق الذكية من حالة السيرفر
 async def check_server_status(ip, port):
     server_key = f"{ip}:{port}"
     offline_counters.setdefault(server_key, 0)
 
     try:
-        # نحاول أولاً عبر mcstatus
         server = JavaServer.lookup(server_key)
-        status = server.status()
+        status = await asyncio.wait_for(
+            asyncio.to_thread(server.status), 
+            timeout=5
+        )
         players = getattr(status.players, "online", 0)
         latency = int(getattr(status, "latency", 0))
 
-        # إذا السيرفر يقول أونلاين لكن بدون لاعبين لمرات متكررة، نعتبره فعليًا مغلق
         if players == 0:
             offline_counters[server_key] += 1
         else:
@@ -57,10 +84,13 @@ async def check_server_status(ip, port):
 
         return {"online": True, "players": players, "latency": latency}
 
-    except Exception:
-        # نحاول فحص بديل عبر mcsrvstat.us (احتياطي)
+    except Exception as e:
+        print(f"⚠️ mcstatus فشل لـ {server_key}: {e}")
         try:
-            response = requests.get(f"https://api.mcsrvstat.us/2/{ip}")
+            response = await asyncio.wait_for(
+                asyncio.to_thread(requests.get, f"https://api.mcsrvstat.us/2/{ip}"),
+                timeout=5
+            )
             data = response.json()
             if data.get("online"):
                 players = data.get("players", {}).get("online", 0)
@@ -71,13 +101,13 @@ async def check_server_status(ip, port):
                 if offline_counters[server_key] >= 2:
                     return {"online": False, "players": 0, "latency": 0, "reason": "standby"}
                 return {"online": True, "players": players, "latency": 0}
-        except Exception:
-            pass
+        except Exception as e2:
+            print(f"⚠️ API backup فشل لـ {server_key}: {e2}")
 
+    offline_counters[server_key] += 1
     return {"online": False, "players": 0, "latency": 0, "reason": "offline"}
 
 # -------------------------------------------------------------------
-# دالة بناء الـ Embed المعروض في الرسالة المثبتة
 def build_embed(ip: str, port: str, version: str, status_info: dict, board: str = "Vanilla Survival"):
     reason = status_info.get("reason", "")
     if status_info.get("online"):
@@ -99,7 +129,6 @@ def build_embed(ip: str, port: str, version: str, status_info: dict, board: str 
     return embed
 
 # -------------------------------------------------------------------
-# باقي الأوامر (نفسها بدون تعديل)
 @bot.tree.command(name="تحديد", description="تحديد السيرفر الذي تريد مراقبته")
 @app_commands.describe(address="أدخل IP والبورت بالشكل: play.server.com:25565")
 async def تحديد(interaction: discord.Interaction, address: str):
@@ -125,7 +154,7 @@ async def تحديد(interaction: discord.Interaction, address: str):
     await interaction.response.send_message(f"✅ تم حفظ السيرفر: `{ip}:{port}` بنجاح!", ephemeral=True)
 
 # -------------------------------------------------------------------
-@bot.tree.command(name="مدعوم", description="حدد نوع النسخة المدعومة للسيرفر (جافا، بيدروك، أو كلاهما)")
+@bot.tree.command(name="مدعوم", description="حدد نوع النسخة المدعومة للسيرفر")
 @app_commands.choices(version=[
     app_commands.Choice(name="جافا", value="جافا"),
     app_commands.Choice(name="بيدروك", value="بيدروك"),
@@ -142,7 +171,7 @@ async def مدعوم(interaction: discord.Interaction, version: app_commands.Cho
     await interaction.response.send_message(f"✅ تم تحديث النسخة المدعومة إلى: **{version.value}**", ephemeral=True)
 
 # -------------------------------------------------------------------
-@bot.tree.command(name="تحديد_الروم", description="تحديد الروم الذي يرسل فيه البوت التحديثات المثبتة.")
+@bot.tree.command(name="تحديد_الروم", description="تحديد الروم الذي يرسل فيه البوت التحديثات المثبتة")
 @app_commands.describe(channel="اختر القناة التي تريد أن يرسل فيها البوت التحديث المثبت")
 async def تحديد_الروم(interaction: discord.Interaction, channel: discord.TextChannel):
     user_id = str(interaction.user.id)
@@ -154,7 +183,7 @@ async def تحديد_الروم(interaction: discord.Interaction, channel: disco
     servers_data[user_id]["channel_id"] = channel.id
     save_data(servers_data)
 
-    message_id = servers_data[user_id].get("message_id")
+    await interaction.response.defer(ephemeral=True)
 
     ip = servers_data[user_id]["ip"]
     port = servers_data[user_id]["port"]
@@ -163,37 +192,32 @@ async def تحديد_الروم(interaction: discord.Interaction, channel: disco
 
     status = await check_server_status(ip, port)
     embed = build_embed(ip, port, version, status, board)
+    view = JoinButton(ip, port)
 
     try:
-        target_channel = channel
+        message_id = servers_data[user_id].get("message_id")
         if message_id:
             try:
-                msg = await target_channel.fetch_message(message_id)
-                await msg.edit(embed=embed)
-                await interaction.response.send_message(f"✅ تم تحديث الرسالة المثبتة في {channel.mention}", ephemeral=True)
-            except Exception:
-                sent = await target_channel.send(embed=embed)
-                try:
-                    await sent.pin()
-                except Exception:
-                    pass
-                servers_data[user_id]["message_id"] = sent.id
-                save_data(servers_data)
-                await interaction.response.send_message(f"✅ تم إنشاء رسالة مثبتة جديدة في {channel.mention}", ephemeral=True)
-        else:
-            sent = await target_channel.send(embed=embed)
-            try:
-                await sent.pin()
-            except Exception:
+                msg = await channel.fetch_message(message_id)
+                await msg.edit(embed=embed, view=view)
+                await interaction.followup.send(f"✅ تم تحديث الرسالة المثبتة في {channel.mention}", ephemeral=True)
+                return
+            except:
                 pass
-            servers_data[user_id]["message_id"] = sent.id
-            save_data(servers_data)
-            await interaction.response.send_message(f"✅ تم إنشاء رسالة مثبتة في {channel.mention}", ephemeral=True)
+
+        sent = await channel.send(embed=embed, view=view)
+        try:
+            await sent.pin()
+        except:
+            pass
+        servers_data[user_id]["message_id"] = sent.id
+        save_data(servers_data)
+        await interaction.followup.send(f"✅ تم إنشاء رسالة مثبتة في {channel.mention}", ephemeral=True)
 
     except discord.Forbidden:
-        await interaction.response.send_message("⚠️ لا أملك صلاحية كافية في هذه القناة.", ephemeral=True)
+        await interaction.followup.send("⚠️ لا أملك صلاحية كافية في هذه القناة.", ephemeral=True)
     except Exception as e:
-        await interaction.response.send_message(f"❌ حدث خطأ أثناء إنشاء الرسالة: {e}", ephemeral=True)
+        await interaction.followup.send(f"❌ حدث خطأ: {e}", ephemeral=True)
 
 # -------------------------------------------------------------------
 class JoinButton(discord.ui.View):
@@ -202,17 +226,19 @@ class JoinButton(discord.ui.View):
         self.ip = ip
         self.port = port
 
-    @discord.ui.button(label="انضمام", style=discord.ButtonStyle.green)
+    @discord.ui.button(label="انضمام", style=discord.ButtonStyle.green, custom_id="join_server_btn")
     async def join(self, interaction: discord.Interaction, button: discord.ui.Button):
         try:
             await interaction.user.send(f"📌 Board: Vanilla Survival\n🌐 IP: {self.ip}\n🔌 Port: {self.port}")
             await interaction.response.send_message("📩 تم إرسال IP والبورت إلى الخاص!", ephemeral=True)
         except discord.Forbidden:
-            await interaction.response.send_message("⚠️ لا أستطيع إرسال رسالة خاصة لك!", ephemeral=True)
+            await interaction.response.send_message("⚠️ لا أستطيع إرسال رسالة خاصة لك! تأكد من فتح الرسائل الخاصة.", ephemeral=True)
 
 # -------------------------------------------------------------------
 @tasks.loop(minutes=1)
 async def update_servers():
+    await bot.wait_until_ready()
+    
     for user_id, info in list(servers_data.items()):
         try:
             ip = info.get("ip")
@@ -237,19 +263,21 @@ async def update_servers():
                 try:
                     msg = await channel.fetch_message(message_id)
                     await msg.edit(embed=embed, view=view)
-                except Exception:
+                except discord.NotFound:
                     sent = await channel.send(embed=embed, view=view)
                     try:
                         await sent.pin()
-                    except Exception:
+                    except:
                         pass
                     servers_data[user_id]["message_id"] = sent.id
                     save_data(servers_data)
+                except Exception as e:
+                    print(f"⚠️ خطأ في تحديث الرسالة: {e}")
             else:
                 sent = await channel.send(embed=embed, view=view)
                 try:
                     await sent.pin()
-                except Exception:
+                except:
                     pass
                 servers_data[user_id]["message_id"] = sent.id
                 save_data(servers_data)
@@ -263,15 +291,29 @@ async def update_servers():
 @bot.event
 async def on_ready():
     print(f"✅ {bot.user} is online and ready!")
+    print(f"📊 Servers in database: {len(servers_data)}")
+    
     try:
         synced = await bot.tree.sync()
         print(f"🔁 Synced {len(synced)} command(s)")
     except Exception as e:
         print(f"❌ Error syncing commands: {e}")
 
+    # تسجيل الـ View للأزرار
+    bot.add_view(JoinButton("", ""))
+
     if not update_servers.is_running():
         update_servers.start()
+        print("🔄 Auto-update task started")
 
 # -------------------------------------------------------------------
-bot.run(TOKEN)
-
+if __name__ == "__main__":
+    # بدء الـ health check server في thread منفصل
+    health_thread = Thread(target=run_health_server, daemon=True)
+    health_thread.start()
+    
+    # بدء البوت
+    try:
+        bot.run(TOKEN)
+    except Exception as e:
+        print(f"❌ خطأ في تشغيل البوت: {e}")
